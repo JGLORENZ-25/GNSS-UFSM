@@ -137,12 +137,21 @@
             <div id="connection" class="tab-content active">
                 <div class="card">
                     <h3>📷 Receptor GNSS Bluetooth</h3>
-                    <p style="font-size: 0.9em; color: #666; margin-bottom: 15px;">Pareie seu receptor (Ex: South S82-T) com o seu computador ou celular antes de conectar.</p>
+                    <p style="font-size: 0.9em; color: #666; margin-bottom: 15px;">Pareie seu receptor com o seu computador ou celular antes de conectar.</p>
                     <div class="button-group">
                         <button class="btn btn-primary" onclick="connectBluetooth()"><span id="btConnectText">📱 Conectar Bluetooth</span></button>
                         <button class="btn btn-danger" onclick="disconnect()">❌ Desconectar</button>
                     </div>
-                    <div id="connectionStatus" class="status disconnected">❌ Desconectado - Aguardando conexão</div>
+                    <div id="btConnectionStatus" class="status disconnected">❌ Desconectado</div>
+                </div>
+                <div class="card">
+                    <h3>🔌 Receptor GNSS via Cabo (USB)</h3>
+                    <p style="font-size: 0.9em; color: #666; margin-bottom: 15px;">Conecte o receptor ao seu computador via cabo USB. O navegador solicitará acesso à porta serial (COM).</p>
+                    <div class="button-group">
+                        <button class="btn btn-primary" onclick="connectUSB()"><span id="usbConnectText">🔌 Conectar USB</span></button>
+                        <button class="btn btn-danger" onclick="disconnect()">❌ Desconectar</button>
+                    </div>
+                    <div id="usbConnectionStatus" class="status disconnected">❌ Desconectado</div>
                 </div>
             </div>
 
@@ -222,10 +231,12 @@ let appState = {
     geometryType: 'POINT',
     isCollecting: false,
     bluetoothDevice: null,
+    usbPort: null,
+    connectionType: null, // 'bluetooth' ou 'usb'
     currentLocation: { lat: 0, lon: 0, alt: 0, accuracy: 99, satellites: 0, rtkStatus: '--', hdop: '--' },
     locationMode: 'device',
     deviceWatchId: null,
-    btCharacteristic: null,
+    keepReadingSerial: false,
 };
 
 let map = null, currentLocationMarker = null, accuracyCircle = null, collectedPointsLayer = null;
@@ -243,79 +254,128 @@ function initializePWA() {
 }
 
 // ================================
-// CONTROLE DE LOCALIZAÇÃO E BLUETOOTH
+// CONTROLE DE CONEXÃO (BLUETOOTH E USB)
 // ================================
 
-function changeLocationMode() {
-    const mode = document.getElementById('locationMode').value;
-    appState.locationMode = mode;
-    if (mode === 'device') {
-        startDeviceGNSS();
-        disconnect(); // Garante que a conexão BT seja encerrada
-    } else {
-        stopDeviceGNSS();
-    }
-    updateLocationDisplay();
-}
-
 async function connectBluetooth() {
-    if (!navigator.bluetooth) {
-        alert('A Web Bluetooth API não é suportada neste navegador. Tente usar o Chrome ou Edge.');
-        return;
-    }
-    const connectBtn = document.getElementById('btConnectText');
+    if (!navigator.bluetooth) return alert('A Web Bluetooth API não é suportada neste navegador. Tente usar o Chrome ou Edge.');
+    
+    await disconnect();
+    stopDeviceGNSS();
+    
+    updateBtConnectionStatus('connecting', '🔄 Procurando dispositivos...');
+    
     try {
-        stopDeviceGNSS();
-        updateConnectionStatus('connecting', '🔄 Procurando por dispositivos Bluetooth...');
-        connectBtn.innerHTML = '<span class="loading"></span>Procurando...';
-
         const device = await navigator.bluetooth.requestDevice({
             filters: [{ namePrefix: 'South' }, { namePrefix: 'S82' }],
-            optionalServices: ['00001101-0000-1000-8000-00805f9b34fb'] // UUID Padrão para Serial Port Profile (SPP)
+            optionalServices: ['00001101-0000-1000-8000-00805f9b34fb']
         });
         
         device.addEventListener('gattserverdisconnected', onDisconnected);
-        updateConnectionStatus('connecting', `🔌 Conectando ao ${device.name}...`);
+        updateBtConnectionStatus('connecting', `🔌 Conectando a ${device.name}...`);
         const server = await device.gatt.connect();
         const service = await server.getPrimaryService('00001101-0000-1000-8000-00805f9b34fb');
         const characteristic = await service.getCharacteristic('00001101-0000-1000-8000-00805f9b34fb');
         
         await characteristic.startNotifications();
-        
-        const nmeaParser = new NmeaParser();
-        const textDecoder = new TextDecoder();
-        let nmeaBuffer = '';
-
-        characteristic.addEventListener('characteristicvaluechanged', event => {
-            nmeaBuffer += textDecoder.decode(event.target.value);
-            let newlineIndex;
-            while ((newlineIndex = nmeaBuffer.indexOf('\n')) >= 0) {
-                const sentence = nmeaBuffer.substring(0, newlineIndex).trim();
-                nmeaBuffer = nmeaBuffer.substring(newlineIndex + 1);
-                if (sentence.startsWith('$')) {
-                    try {
-                        const parsedData = nmeaParser.parse(sentence);
-                        if (parsedData.latitude && parsedData.longitude) {
-                            updateStateWithRealData(parsedData);
-                        }
-                    } catch (e) { /* Ignora sentenças malformadas */ }
-                }
-            }
-        });
+        characteristic.addEventListener('characteristicvaluechanged', handleNmeaData);
         
         appState.isConnected = true;
         appState.bluetoothDevice = device;
-        appState.btCharacteristic = characteristic;
+        appState.connectionType = 'bluetooth';
         appState.locationMode = 'rtk';
         document.getElementById('locationMode').value = 'rtk';
 
-        updateConnectionStatus('connected', `✅ Conectado via Bluetooth a ${device.name}`);
-        connectBtn.textContent = '📱 Conectar Bluetooth';
-
+        updateBtConnectionStatus('connected', `✅ Conectado a ${device.name}`);
     } catch (error) {
-        console.error('❌ Erro na conexão Bluetooth:', error);
-        updateConnectionStatus('disconnected', '❌ Erro: ' + error.message);
-        connectBtn.textContent = '📱 Conectar Bluetooth';
+        console.error('❌ Erro Bluetooth:', error);
+        updateBtConnectionStatus('disconnected', '❌ Erro: ' + error.message);
+    }
+}
+
+async function connectUSB() {
+    if (!("serial" in navigator)) return alert("A Web Serial API não é suportada neste navegador. Tente usar o Chrome ou Edge.");
+
+    await disconnect();
+    stopDeviceGNSS();
+
+    updateUsbConnectionStatus('connecting', '🔄 Selecione a porta serial...');
+
+    try {
+        const port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        appState.isConnected = true;
+        appState.usbPort = port;
+        appState.connectionType = 'usb';
+        appState.locationMode = 'rtk';
+        document.getElementById('locationMode').value = 'rtk';
+        appState.keepReadingSerial = true;
+
+        updateUsbConnectionStatus('connected', '✅ Conectado via USB');
+
+        const textDecoder = new TextDecoderStream();
+        port.readable.pipeTo(textDecoder.writable);
+        const reader = textDecoder.readable.getReader();
+
+        while (port.readable && appState.keepReadingSerial) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            handleNmeaData({ target: { value: new TextEncoder().encode(value) } });
+        }
+        reader.releaseLock();
+    } catch (error) {
+        console.error('❌ Erro Serial:', error);
+        updateUsbConnectionStatus('disconnected', '❌ Erro: ' + error.message);
+    }
+}
+
+async function disconnect() {
+    // Desconecta Bluetooth
+    if (appState.bluetoothDevice && appState.bluetoothDevice.gatt.connected) {
+        appState.bluetoothDevice.gatt.disconnect();
+    }
+    // Desconecta USB
+    if (appState.usbPort) {
+        appState.keepReadingSerial = false;
+        await appState.usbPort.close().catch(() => {});
+    }
+    onDisconnected();
+}
+
+function onDisconnected() {
+    appState.isConnected = false;
+    appState.bluetoothDevice = null;
+    appState.usbPort = null;
+    appState.connectionType = null;
+    updateBtConnectionStatus('disconnected', '❌ Desconectado');
+    updateUsbConnectionStatus('disconnected', '❌ Desconectado');
+    console.log('Dispositivos desconectados.');
+}
+
+
+// ================================
+// PROCESSAMENTO DE DADOS E ESTADO
+// ================================
+
+let nmeaBuffer = '';
+const nmeaParser = new NmeaParser();
+const textDecoder = new TextDecoder();
+
+function handleNmeaData(event) {
+    nmeaBuffer += textDecoder.decode(event.target.value);
+    let newlineIndex;
+    while ((newlineIndex = nmeaBuffer.indexOf('\n')) >= 0) {
+        const sentence = nmeaBuffer.substring(0, newlineIndex).trim();
+        nmeaBuffer = nmeaBuffer.substring(newlineIndex + 1);
+        if (sentence.startsWith('$')) {
+            try {
+                const parsedData = nmeaParser.parse(sentence);
+                if (parsedData.latitude && parsedData.longitude) {
+                    updateStateWithRealData(parsedData);
+                }
+            } catch (e) { /* Ignora sentenças malformadas */ }
+        }
     }
 }
 
@@ -326,7 +386,7 @@ function updateStateWithRealData(data) {
         lat: data.latitude,
         lon: data.longitude,
         alt: data.altitude || 0,
-        accuracy: data.hdop ? (data.hdop * 1.5).toFixed(2) : 99, // Estimativa de precisão
+        accuracy: data.hdop ? (data.hdop * 1.5).toFixed(2) : 99,
         satellites: data.satellitesInView || data.satellites?.length || 0,
         hdop: data.hdop || '--',
         rtkStatus: qualityMap[data.fixQuality] || 'N/A'
@@ -344,35 +404,30 @@ function updateStateWithRealData(data) {
     }
 }
 
-async function disconnect() {
-    if (appState.bluetoothDevice && appState.bluetoothDevice.gatt.connected) {
-        appState.bluetoothDevice.gatt.disconnect();
-    } else {
-        onDisconnected();
-    }
-}
+// ================================
+// CONTROLE DE LOCALIZAÇÃO DO DISPOSITIVO (CELULAR/PC)
+// ================================
 
-function onDisconnected() {
-    if (appState.btCharacteristic) {
-        appState.btCharacteristic.removeEventListener('characteristicvaluechanged', ()=>{});
-        appState.btCharacteristic = null;
+function changeLocationMode() {
+    const mode = document.getElementById('locationMode').value;
+    appState.locationMode = mode;
+    if (mode === 'device') {
+        startDeviceGNSS();
+        disconnect();
+    } else {
+        stopDeviceGNSS();
     }
-    appState.isConnected = false;
-    appState.bluetoothDevice = null;
-    updateConnectionStatus('disconnected', '❌ Desconectado');
-    console.log('Dispositivo Bluetooth desconectado.');
+    updateLocationDisplay();
 }
 
 function startDeviceGNSS() {
-    if (!navigator.geolocation) { return; }
+    if (!navigator.geolocation) return;
     const options = { enableHighAccuracy: document.getElementById('accuracyMode').value === 'high', timeout: 10000, maximumAge: 0 };
     appState.deviceWatchId = navigator.geolocation.watchPosition(
         position => {
             const { latitude, longitude, altitude, accuracy } = position.coords;
             appState.currentLocation = { lat: latitude, lon: longitude, alt: altitude || 0, accuracy: accuracy.toFixed(2), satellites: '--', hdop: '--', rtkStatus: 'N/A' };
-            if (appState.locationMode === 'device') {
-                updateLocationDisplay();
-            }
+            if (appState.locationMode === 'device') updateLocationDisplay();
         },
         () => { updatePositioningStatus('disconnected', '❌ Erro ao obter localização do dispositivo.'); },
         options
@@ -392,14 +447,12 @@ function stopDeviceGNSS() {
 
 
 // ================================
-// GERENCIAMENTO DE DADOS E PONTOS
+// COLETA DE DADOS E GEOMETRIAS
 // ================================
 
 function collectPoint(type = 'POINT') {
-    const hasDeviceLocation = appState.locationMode === 'device' && appState.deviceWatchId;
-    const hasRTKLocation = appState.locationMode === 'rtk' && appState.isConnected;
-    
-    if ((!hasDeviceLocation && !hasRTKLocation) || appState.currentLocation.lat === 0) {
+    const hasLocation = (appState.locationMode === 'device' && appState.deviceWatchId) || (appState.locationMode === 'rtk' && appState.isConnected);
+    if (!hasLocation || appState.currentLocation.lat === 0) {
         updateCollectionStatus('info', '⚠️ Aguardando uma localização válida...');
         return;
     }
@@ -407,28 +460,18 @@ function collectPoint(type = 'POINT') {
     const description = document.getElementById('pointDescription').value || `Ponto ${appState.collectedPoints.length + 1}`;
     
     const point = {
-        id: Date.now(),
-        type: type,
-        latitude: appState.currentLocation.lat,
-        longitude: appState.currentLocation.lon,
-        altitude: appState.currentLocation.alt,
-        accuracy: appState.currentLocation.accuracy,
-        satellites: appState.currentLocation.satellites,
-        hdop: appState.currentLocation.hdop,
-        locationSource: appState.locationMode.toUpperCase(),
-        rtkStatus: appState.currentLocation.rtkStatus,
-        description: description,
-        timestamp: new Date().toISOString(),
-        geometry: appState.currentGeometry,
+        id: Date.now(), type, latitude: appState.currentLocation.lat, longitude: appState.currentLocation.lon,
+        altitude: appState.currentLocation.alt, accuracy: appState.currentLocation.accuracy,
+        satellites: appState.currentLocation.satellites, hdop: appState.currentLocation.hdop,
+        locationSource: appState.locationMode.toUpperCase(), rtkStatus: appState.currentLocation.rtkStatus,
+        description, timestamp: new Date().toISOString(), geometry: appState.currentGeometry,
     };
 
     appState.collectedPoints.push(point);
     addPointToMap(point);
     saveDataToStorage();
-    
     updateCollectionStatus('connected', `✅ Ponto coletado! Precisão: ${point.accuracy}m`);
     document.getElementById('pointDescription').value = '';
-    
     animateCollection();
     updateDataSummary();
 }
@@ -464,7 +507,7 @@ function finishGeometry() {
 }
 
 // ================================
-// MAPA E INTERFACE
+// MAPA, UI E ATUALIZAÇÕES DE TELA
 // ================================
 
 function initializeMap() {
@@ -502,12 +545,12 @@ function updateLocationDisplay() {
 
     const statusMessage = appState.locationMode === 'device' 
         ? `✅ GNSS do dispositivo ativo`
-        : (appState.isConnected ? `✅ Receptor RTK ativo` : `❌ Conecte o receptor RTK`);
+        : (appState.isConnected ? `✅ Receptor RTK ativo via ${appState.connectionType.toUpperCase()}` : `❌ Conecte o receptor RTK`);
     updatePositioningStatus(appState.isConnected || appState.deviceWatchId ? 'connected' : 'disconnected', statusMessage);
 
     if (map && loc.lat !== 0 && loc.lon !== 0) {
         const latLng = [loc.lat, loc.lon];
-        const accuracyRadius = Math.min(parseFloat(loc.accuracy) || 0, 10000); // Limita o raio
+        const accuracyRadius = Math.min(parseFloat(loc.accuracy) || 0, 10000);
         if (!currentLocationMarker) {
             const icon = L.divIcon({ html: '📍', className: 'current-location-icon', iconSize: [30, 30], iconAnchor: [15, 30] });
             currentLocationMarker = L.marker(latLng, { icon }).addTo(map);
@@ -516,13 +559,10 @@ function updateLocationDisplay() {
         } else {
             currentLocationMarker.setLatLng(latLng);
             accuracyCircle.setLatLng(latLng).setRadius(accuracyRadius);
-            if (map.getBounds().contains(latLng) === false) {
-                 map.panTo(latLng);
-            }
+            if (!map.getBounds().contains(latLng)) map.panTo(latLng);
         }
     }
 }
-
 
 function updateDataSummary() {
     const pointsCount = appState.collectedPoints.length;
@@ -562,8 +602,24 @@ function refreshData() {
     updateCollectionStatus('info', 'Dados atualizados');
 }
 
+function showTab(tabName) {
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.getElementById(tabName).classList.add('active');
+    document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
+    if (tabName === 'collection' && !map) initializeMap();
+    else if (tabName === 'collection' && map) setTimeout(() => map.invalidateSize(), 100);
+    if (tabName === 'data') updateDataSummary();
+}
+
+function animateCollection() {
+    const btn = document.getElementById('collectPointBtn');
+    btn.style.transform = 'scale(1.1)';
+    setTimeout(() => { btn.style.transform = 'scale(1)'; }, 300);
+}
+
 // ================================
-// EXPORTAÇÃO E PERSISTÊNCIA
+// EXPORTAÇÃO, PERSISTÊNCIA E UTILITÁRIOS
 // ================================
 
 function exportGeoJSON() {
@@ -574,7 +630,7 @@ function exportGeoJSON() {
         type: "FeatureCollection", name: projectName,
         features: appState.collectedPoints.map(p => ({
             type: "Feature",
-            properties: { name: p.description, accuracy: p.accuracy, satellites: p.satellites, rtk_status: p.rtkStatus, hdop: p.hdop, timestamp: p.timestamp },
+            properties: { name: p.description, accuracy_m: p.accuracy, satellites: p.satellites, rtk_status: p.rtkStatus, hdop: p.hdop, timestamp: p.timestamp, geometry_id: p.geometry || null },
             geometry: { type: "Point", coordinates: [parseFloat(p.longitude.toFixed(precision)), parseFloat(p.latitude.toFixed(precision)), parseFloat(p.altitude.toFixed(2))] }
         }))
     };
@@ -585,9 +641,9 @@ function exportCSV() {
     if (appState.collectedPoints.length === 0) return alert('Nenhum ponto para exportar.');
     const projectName = document.getElementById('projectName').value || 'RTK_Collection';
     const precision = parseInt(document.getElementById('precision').value);
-    let csvContent = 'ID,Nome,Latitude,Longitude,Altitude,Precisao_m,Status_RTK,Satelites,HDOP,Data_Coleta\n';
+    let csvContent = 'ID,Nome,Latitude,Longitude,Altitude,Precisao_m,Status_RTK,Satelites,HDOP,Data_Coleta,Geometria_ID\n';
     appState.collectedPoints.forEach((p, i) => {
-        csvContent += `${i + 1},"${p.description}",${p.latitude.toFixed(precision)},${p.longitude.toFixed(precision)},${p.altitude.toFixed(2)},${p.accuracy},"${p.rtkStatus}",${p.satellites},${p.hdop},"${p.timestamp}"\n`;
+        csvContent += `${i + 1},"${p.description}",${p.latitude.toFixed(precision)},${p.longitude.toFixed(precision)},${p.altitude.toFixed(2)},${p.accuracy},"${p.rtkStatus}",${p.satellites},${p.hdop},"${p.timestamp}","${p.geometry || ''}"\n`;
     });
     downloadFile(`${projectName}.csv`, csvContent, 'text/csv;charset=utf-8;');
 }
@@ -604,7 +660,7 @@ function downloadFile(filename, content, mimeType) {
 
 function saveDataToStorage() {
     try {
-        const stateToSave = { ...appState, bluetoothDevice: null, btCharacteristic: null };
+        const stateToSave = { ...appState, bluetoothDevice: null, usbPort: null, isConnected: false, connectionType: null };
         localStorage.setItem('rtkCollectorAppState', JSON.stringify(stateToSave));
     } catch (e) { console.warn('Erro ao salvar dados:', e); }
 }
@@ -613,42 +669,18 @@ function loadStoredData() {
     const storedState = localStorage.getItem('rtkCollectorAppState');
     if (storedState) {
         Object.assign(appState, JSON.parse(storedState));
-        appState.bluetoothDevice = null;
-        appState.btCharacteristic = null;
-        appState.isConnected = false;
         updateDataSummary();
     }
 }
 
-// ================================
-// FUNÇÕES UTILITÁRIAS DE UI
-// ================================
-
-function showTab(tabName) {
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.getElementById(tabName).classList.add('active');
-    document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
-    if (tabName === 'collection') {
-        if (!map) initializeMap();
-        else setTimeout(() => map.invalidateSize(), 100);
-    }
-    if (tabName === 'data') updateDataSummary();
-}
-
 function quickCollect() { collectPoint('POINT'); }
-function animateCollection() {
-    const btn = document.getElementById('collectPointBtn');
-    btn.style.transform = 'scale(1.1)';
-    setTimeout(() => { btn.style.transform = 'scale(1)'; }, 300);
-}
-
-function updateConnectionStatus(status, message) { document.getElementById('connectionStatus').className = `status ${status}`; document.getElementById('connectionStatus').textContent = message; }
+function updateBtConnectionStatus(status, message) { document.getElementById('btConnectionStatus').className = `status ${status}`; document.getElementById('btConnectionStatus').textContent = message; }
+function updateUsbConnectionStatus(status, message) { document.getElementById('usbConnectionStatus').className = `status ${status}`; document.getElementById('usbConnectionStatus').textContent = message; }
 function updatePositioningStatus(status, message) { document.getElementById('positioningStatus').className = `status ${status}`; document.getElementById('positioningStatus').textContent = message; }
 function updateCollectionStatus(status, message) { document.getElementById('collectionStatus').className = `status ${status}`; document.getElementById('collectionStatus').textContent = message; }
 
 document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); quickCollect(); } });
-setInterval(saveDataToStorage, 60000);
+setInterval(saveDataToStorage, 30000);
 
 </script>
 </body>
