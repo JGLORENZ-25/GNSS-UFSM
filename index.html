@@ -210,6 +210,8 @@
                     <div class="button-group">
                         <button class="btn btn-primary" onclick="exportGeoJSON()">🌐 Exportar GeoJSON</button>
                         <button class="btn btn-primary" onclick="exportCSV()">📊 Exportar CSV</button>
+                        <button class="btn btn-primary" onclick="exportKMZ()">🗺️ Exportar KMZ (Google Earth)</button>
+                        <button class="btn btn-primary" onclick="exportGeoPackage()">📦 Exportar GeoPackage</button>
                     </div>
                     <div id="exportStatus" class="status info">💡 Selecione o formato desejado para exportação</div>
                 </div>
@@ -315,15 +317,19 @@ async function connectUSB() {
         updateUsbConnectionStatus('connected', '✅ Conectado via USB');
 
         const textDecoder = new TextDecoderStream();
-        port.readable.pipeTo(textDecoder.writable);
+        const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
         const reader = textDecoder.readable.getReader();
 
         while (port.readable && appState.keepReadingSerial) {
             const { value, done } = await reader.read();
-            if (done) break;
-            handleNmeaData({ target: { value: new TextEncoder().encode(value) } });
+            if (done) {
+                reader.releaseLock();
+                break;
+            }
+            const event = { target: { value: new TextEncoder().encode(value) } };
+            handleNmeaData(event);
         }
-        reader.releaseLock();
+        
     } catch (error) {
         console.error('❌ Erro Serial:', error);
         updateUsbConnectionStatus('disconnected', '❌ Erro: ' + error.message);
@@ -331,13 +337,17 @@ async function connectUSB() {
 }
 
 async function disconnect() {
-    // Desconecta Bluetooth
     if (appState.bluetoothDevice && appState.bluetoothDevice.gatt.connected) {
         appState.bluetoothDevice.gatt.disconnect();
     }
-    // Desconecta USB
     if (appState.usbPort) {
         appState.keepReadingSerial = false;
+        if (appState.usbPort.readable) {
+            // Cancelar o leitor para liberar a porta antes de fechar
+            const reader = appState.usbPort.readable.getReader();
+            await reader.cancel();
+            reader.releaseLock();
+        }
         await appState.usbPort.close().catch(() => {});
     }
     onDisconnected();
@@ -411,25 +421,40 @@ function updateStateWithRealData(data) {
 function changeLocationMode() {
     const mode = document.getElementById('locationMode').value;
     appState.locationMode = mode;
+    // Lógica para garantir que uma fonte desative a outra
     if (mode === 'device') {
+        stopDeviceGNSS(); // Garante que a lógica antiga pare antes de iniciar uma nova
         startDeviceGNSS();
-        disconnect();
-    } else {
+        disconnect(); // Desconecta qualquer hardware externo
+    } else { // modo 'rtk'
         stopDeviceGNSS();
     }
-    updateLocationDisplay();
+    updateLocationDisplay(); // Atualiza a UI para refletir o novo estado
 }
 
 function startDeviceGNSS() {
-    if (!navigator.geolocation) return;
+    if (!navigator.geolocation) {
+        alert("Geolocalização não é suportada por este navegador.");
+        return;
+    }
+    stopDeviceGNSS(); // Garante que não haja watchers duplicados
+
     const options = { enableHighAccuracy: document.getElementById('accuracyMode').value === 'high', timeout: 10000, maximumAge: 0 };
+    
     appState.deviceWatchId = navigator.geolocation.watchPosition(
         position => {
-            const { latitude, longitude, altitude, accuracy } = position.coords;
-            appState.currentLocation = { lat: latitude, lon: longitude, alt: altitude || 0, accuracy: accuracy.toFixed(2), satellites: '--', hdop: '--', rtkStatus: 'N/A' };
-            if (appState.locationMode === 'device') updateLocationDisplay();
+            // Este callback só deve atualizar o estado se o modo 'device' estiver ativo
+            if (appState.locationMode === 'device') {
+                const { latitude, longitude, altitude, accuracy } = position.coords;
+                appState.currentLocation = { lat: latitude, lon: longitude, alt: altitude || 0, accuracy: accuracy.toFixed(2), satellites: '--', hdop: '--', rtkStatus: 'N/A' };
+                updateLocationDisplay();
+            }
         },
-        () => { updatePositioningStatus('disconnected', '❌ Erro ao obter localização do dispositivo.'); },
+        () => { 
+            if (appState.locationMode === 'device') {
+                updatePositioningStatus('disconnected', '❌ Erro ao obter localização do dispositivo.');
+            }
+        },
         options
     );
     document.getElementById('gnssStatus').className = 'status connected';
@@ -621,6 +646,54 @@ function animateCollection() {
 // ================================
 // EXPORTAÇÃO, PERSISTÊNCIA E UTILITÁRIOS
 // ================================
+
+function exportKMZ() {
+    if (appState.collectedPoints.length === 0) return alert('Nenhum ponto para exportar.');
+    const projectName = document.getElementById('projectName').value || 'RTK_Collection';
+
+    let kmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+    <Document>
+        <name>${projectName}</name>
+        <description>Dados coletados com o RTK Data Collector</description>
+        <Style id="pointStyle">
+            <IconStyle>
+                <Icon><href>http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png</href></Icon>
+                <scale>1.1</scale>
+            </IconStyle>
+        </Style>`;
+
+    appState.collectedPoints.forEach(p => {
+        kmlContent += `
+        <Placemark>
+            <name>${p.description}</name>
+            <description>
+                <![CDATA[
+                    <b>Latitude:</b> ${p.latitude.toFixed(8)}<br/>
+                    <b>Longitude:</b> ${p.longitude.toFixed(8)}<br/>
+                    <b>Altitude:</b> ${p.altitude.toFixed(2)} m<br/>
+                    <b>Precisão:</b> ${p.accuracy} m<br/>
+                    <b>Status RTK:</b> ${p.rtkStatus}<br/>
+                    <b>Satélites:</b> ${p.satellites}<br/>
+                    <b>Data:</b> ${new Date(p.timestamp).toLocaleString()}
+                ]]>
+            </description>
+            <styleUrl>#pointStyle</styleUrl>
+            <Point>
+                <coordinates>${p.longitude},${p.latitude},${p.altitude}</coordinates>
+            </Point>
+        </Placemark>`;
+    });
+
+    kmlContent += `
+    </Document>
+</kml>`;
+    downloadFile(`${projectName}.kml`, kmlContent, 'application/vnd.google-earth.kml+xml');
+}
+
+function exportGeoPackage() {
+    alert('A exportação para GeoPackage é um recurso complexo e ainda não está implementado.\n\nRecomendação: Exporte para GeoJSON e utilize um software de GIS (como o QGIS, que é gratuito) para converter para GeoPackage, se necessário.');
+}
 
 function exportGeoJSON() {
     if (appState.collectedPoints.length === 0) return alert('Nenhum ponto para exportar.');
