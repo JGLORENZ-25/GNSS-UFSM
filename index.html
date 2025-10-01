@@ -122,7 +122,7 @@
                     <div id="gnssStatus" class="status info">ℹ️ GNSS do dispositivo pronto para uso</div>
                 </div>
                 <div class="card">
-                    <h3>📊 Informações dos Satélites (Recebidas do Equipamento)</h3>
+                    <h3>📊 Informações dos Satélites</h3>
                     <div class="data-display">
                         <div class="data-item"><div class="label">GPS</div><div class="value" id="gpsCount">--</div></div>
                         <div class="data-item"><div class="label">GLONASS</div><div class="value" id="glonassCount">--</div></div>
@@ -210,7 +210,7 @@
                     <div class="button-group">
                         <button class="btn btn-primary" onclick="exportGeoJSON()">🌐 Exportar GeoJSON</button>
                         <button class="btn btn-primary" onclick="exportCSV()">📊 Exportar CSV</button>
-                        <button class="btn btn-primary" onclick="exportKMZ()">🗺️ Exportar KMZ</button>
+                        <button class="btn btn-primary" onclick="exportKMZ()">🗺️ Exportar KMZ (Google Earth)</button>
                         <button class="btn btn-primary" onclick="exportGeoPackage()">📦 Exportar GeoPackage</button>
                     </div>
                     <div id="exportStatus" class="status info">💡 Selecione o formato desejado para exportação</div>
@@ -337,21 +337,26 @@ async function connectUSB() {
 }
 
 async function disconnect() {
+    // Desconecta Bluetooth
     if (appState.bluetoothDevice && appState.bluetoothDevice.gatt.connected) {
         appState.bluetoothDevice.gatt.disconnect();
     }
+    // Desconecta USB
     if (appState.usbPort) {
         appState.keepReadingSerial = false;
+        // A maneira correta de parar um loop de leitura de porta serial é cancelando o leitor
         if (appState.usbPort.readable) {
-            // Cancelar o leitor para liberar a porta antes de fechar
-            const reader = appState.usbPort.readable.getReader();
-            await reader.cancel();
-            reader.releaseLock();
+            try {
+                const reader = appState.usbPort.readable.getReader();
+                await reader.cancel();
+                reader.releaseLock();
+            } catch(e) { /* Ignora erros se a porta já estiver fechando */ }
         }
         await appState.usbPort.close().catch(() => {});
     }
     onDisconnected();
 }
+
 
 function onDisconnected() {
     appState.isConnected = false;
@@ -402,13 +407,17 @@ function updateStateWithRealData(data) {
         rtkStatus: qualityMap[data.fixQuality] || 'N/A'
     };
     
+    // Atualiza a contagem de satélites na tela
     if (data.satellites) {
-        document.getElementById('gpsCount').textContent = data.satellites.filter(s => s.prn >= 1 && s.prn <= 32).length;
-        document.getElementById('glonassCount').textContent = data.satellites.filter(s => s.prn >= 65 && s.prn <= 96).length;
-        document.getElementById('beidouCount').textContent = data.satellites.filter(s => s.prn >= 201 && s.prn <= 236).length;
-        document.getElementById('galileoCount').textContent = data.satellites.filter(s => s.prn >= 301 && s.prn <= 336).length;
+        updateSatelliteDisplay({
+            gps: data.satellites.filter(s => s.prn >= 1 && s.prn <= 32).length,
+            glonass: data.satellites.filter(s => s.prn >= 65 && s.prn <= 96).length,
+            beidou: data.satellites.filter(s => s.prn >= 201 && s.prn <= 236).length,
+            galileo: data.satellites.filter(s => s.prn >= 301 && s.prn <= 336).length
+        });
     }
 
+    // Apenas atualiza a tela se o modo RTK estiver ativo
     if (appState.locationMode === 'rtk') {
         updateLocationDisplay();
     }
@@ -421,7 +430,7 @@ function updateStateWithRealData(data) {
 function changeLocationMode() {
     const mode = document.getElementById('locationMode').value;
     appState.locationMode = mode;
-    // Lógica para garantir que uma fonte desative a outra
+    
     if (mode === 'device') {
         stopDeviceGNSS(); // Garante que a lógica antiga pare antes de iniciar uma nova
         startDeviceGNSS();
@@ -437,18 +446,29 @@ function startDeviceGNSS() {
         alert("Geolocalização não é suportada por este navegador.");
         return;
     }
-    stopDeviceGNSS(); // Garante que não haja watchers duplicados
+    stopDeviceGNSS();
 
     const options = { enableHighAccuracy: document.getElementById('accuracyMode').value === 'high', timeout: 10000, maximumAge: 0 };
     
     appState.deviceWatchId = navigator.geolocation.watchPosition(
         position => {
-            // Este callback só deve atualizar o estado se o modo 'device' estiver ativo
-            if (appState.locationMode === 'device') {
-                const { latitude, longitude, altitude, accuracy } = position.coords;
-                appState.currentLocation = { lat: latitude, lon: longitude, alt: altitude || 0, accuracy: accuracy.toFixed(2), satellites: '--', hdop: '--', rtkStatus: 'N/A' };
-                updateLocationDisplay();
-            }
+            if (appState.locationMode !== 'device') return; // Segurança extra
+
+            const { latitude, longitude, altitude, accuracy } = position.coords;
+            const estimatedSatData = estimateSatelliteDataFromAccuracy(accuracy);
+
+            appState.currentLocation = {
+                lat: latitude,
+                lon: longitude,
+                alt: altitude || 0,
+                accuracy: accuracy.toFixed(2),
+                satellites: estimatedSatData.total,
+                hdop: estimatedSatData.hdop,
+                rtkStatus: 'N/A'
+            };
+
+            updateSatelliteDisplay(estimatedSatData.distribution);
+            updateLocationDisplay();
         },
         () => { 
             if (appState.locationMode === 'device') {
@@ -695,6 +715,7 @@ function exportGeoPackage() {
     alert('A exportação para GeoPackage é um recurso complexo e ainda não está implementado.\n\nRecomendação: Exporte para GeoJSON e utilize um software de GIS (como o QGIS, que é gratuito) para converter para GeoPackage, se necessário.');
 }
 
+
 function exportGeoJSON() {
     if (appState.collectedPoints.length === 0) return alert('Nenhum ponto para exportar.');
     const projectName = document.getElementById('projectName').value || 'RTK_Collection';
@@ -758,4 +779,5 @@ setInterval(saveDataToStorage, 30000);
 </script>
 </body>
 </html>
-
+}
+O que exatamente o RTK Data Collector faz?
